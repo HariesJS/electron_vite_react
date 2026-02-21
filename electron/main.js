@@ -42,6 +42,14 @@ const loadEnvFromFile = (filepath) => {
 loadEnvFromFile(ENV_FILE_PATH)
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY
+const GEMINI_MODEL = process.env.GEMINI_MODEL || DEFAULT_MODEL
+const GEMINI_API_VERSION = process.env.GEMINI_API_VERSION || "v1beta"
+const FALLBACK_MODELS = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
+const GEMINI_BASE_URL = `https://generativelanguage.googleapis.com/${GEMINI_API_VERSION}`
 
 if (!GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is missing. Add it to .env")
@@ -70,42 +78,94 @@ const extractTextFromGeminiResponse = (payload) => {
         .trim()
 }
 
-const parseRetryDelayMs = (payload) => {
-    const details = payload?.error?.details
-
-    if (!Array.isArray(details)) {
-        return null
-    }
-
-    const retryInfo = details.find(
-        (item) =>
-            item?.["@type"] === "type.googleapis.com/google.rpc.RetryInfo",
-    )
-    const retryDelay = retryInfo?.retryDelay
-
-    if (typeof retryDelay !== "string") {
-        return null
-    }
-
-    const matched = retryDelay.match(/^(\d+)s$/)
-    if (!matched) {
-        return null
-    }
-
-    const seconds = Number(matched[1])
-    return Number.isFinite(seconds) ? seconds * 1000 : null
+const normalizeModelName = (raw) => {
+    return raw.startsWith("models/") ? raw.replace("models/", "") : raw
 }
 
-const createQuotaError = (retryMs) => {
-    const retryPart = retryMs
-        ? ` Попробуйте снова через ${Math.ceil(retryMs / 1000)} сек.`
-        : ""
-    return new Error(
-        `Квота Gemini исчерпана для текущего API ключа.${retryPart} Проверьте billing и лимиты: https://ai.google.dev/gemini-api/docs/rate-limits`,
-    )
+const parseErrorPayload = async (response) => {
+    const raw = await response.text()
+
+    try {
+        return {
+            details:
+                (JSON.parse(raw)?.error?.message &&
+                    `${JSON.parse(raw)?.error?.status || ""} ${JSON.parse(raw)?.error?.message}`.trim()) ||
+                raw,
+            raw,
+        }
+    } catch {
+        return {details: raw, raw}
+    }
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const callGemini = async (model, contents) => {
+    const endpoint = `${GEMINI_BASE_URL}/models/${model}:generateContent?key=${GEMINI_API_KEY}`
+    const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+            contents,
+            generationConfig: {
+                temperature: 0.7,
+                topK: 40,
+                topP: 0.95,
+                maxOutputTokens: 1024,
+            },
+        }),
+    })
+
+    if (!response.ok) {
+        const parsed = await parseErrorPayload(response)
+        const shouldTryAnotherModel =
+            parsed.details.includes("is not found for API version") ||
+            parsed.details.includes("is not supported for generateContent")
+
+        return {
+            ok: false,
+            status: response.status,
+            details: parsed.details,
+            shouldTryAnotherModel,
+        }
+    }
+
+    const payload = await response.json()
+    const text = extractTextFromGeminiResponse(payload)
+
+    if (!text) {
+        return {
+            ok: false,
+            status: 502,
+            details: "Gemini returned an empty response",
+            shouldTryAnotherModel: false,
+        }
+    }
+
+    return {ok: true, text, model}
+}
+
+const listGenerateContentModels = async () => {
+    const endpoint = `${GEMINI_BASE_URL}/models?key=${GEMINI_API_KEY}`
+    const response = await fetch(endpoint, {
+        method: "GET",
+        headers: {"Content-Type": "application/json"},
+    })
+
+    if (!response.ok) {
+        return []
+    }
+
+    const data = await response.json()
+    if (!Array.isArray(data.models)) {
+        return []
+    }
+
+    return data.models
+        .filter((model) =>
+            model.supportedGenerationMethods?.includes("generateContent"),
+        )
+        .map((model) => normalizeModelName(model.name ?? ""))
+        .filter(Boolean)
+}
 
 const createWindow = () => {
     const win = new BrowserWindow({
@@ -144,61 +204,43 @@ const createWindow = () => {
 }
 
 ipcMain.handle("chat:send-message", async (_, messages) => {
-    const body = {
-        contents: mapMessagesToGemini(messages),
-        generationConfig: {
-            temperature: 0.7,
-            topK: 40,
-            topP: 0.95,
-            maxOutputTokens: 1024,
-        },
-    }
+    const contents = mapMessagesToGemini(messages)
+    const preferred = normalizeModelName(GEMINI_MODEL)
+    const queue = [preferred, ...FALLBACK_MODELS].map(normalizeModelName)
+    const tried = new Set()
 
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${DEFAULT_MODEL}:generateContent?key=${GEMINI_API_KEY}`
-    const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-    })
+    let lastStatus = 500
+    let lastError = "Gemini request failed"
 
-    if (!response.ok) {
-        const errorBody = await response.text()
-        let payload = null
-
-        try {
-            payload = JSON.parse(errorBody)
-        } catch {
-            payload = null
+    while (queue.length > 0) {
+        const model = queue.shift()
+        if (!model || tried.has(model)) {
+            continue
         }
 
-        const isQuotaError =
-            response.status === 429 ||
-            payload?.error?.status === "RESOURCE_EXHAUSTED"
-        if (isQuotaError) {
-            const retryMs = parseRetryDelayMs(payload)
+        tried.add(model)
 
-            if (retryMs && retryMs <= 5000) {
-                await sleep(retryMs)
+        const result = await callGemini(model, contents)
+        if (result.ok) {
+            return {text: result.text, modelUsed: result.model}
+        }
+
+        lastStatus = result.status
+        lastError = result.details
+
+        if (result.shouldTryAnotherModel) {
+            const discovered = await listGenerateContentModels()
+            for (const discoveredModel of discovered) {
+                if (!tried.has(discoveredModel)) {
+                    queue.push(discoveredModel)
+                }
             }
-
-            throw createQuotaError(retryMs)
         }
-
-        throw new Error(
-            `Gemini request failed: ${response.status} ${errorBody}`,
-        )
     }
 
-    const payload = await response.json()
-    const text = extractTextFromGeminiResponse(payload)
-
-    if (!text) {
-        throw new Error("Gemini returned an empty response")
-    }
-
-    return {text}
+    throw new Error(
+        `Gemini request failed: ${lastStatus} ${lastError}. Tried models: ${Array.from(tried).join(", ")}`,
+    )
 })
 
 app.whenReady().then(createWindow)
