@@ -1,0 +1,21 @@
+:root {
+  font-family: 'Segoe UI', 'Noto Sans', 'Helvetica Neue', sans-serif;
+  color: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+button,
+textarea {
+  font: inherit;
+}
